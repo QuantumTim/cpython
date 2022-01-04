@@ -201,6 +201,11 @@ class Task(futures._PyFuture):  # Inherit Python Task implementation
         self._log_traceback = False
         if self.done():
             return False
+        # Once set, we keep trying to cancel the Task at every
+        # safe opportunity. There's currently no way to stop this,
+        # but maybe we could add CancelledError.abort() or something
+        # for tasks to explicitly stop cancellation.
+        self._must_cancel = True
         if self._fut_waiter is not None:
             if self._fut_waiter.cancel(msg=msg):
                 # Leave self._fut_waiter; it may be a Task that
@@ -208,7 +213,6 @@ class Task(futures._PyFuture):  # Inherit Python Task implementation
                 # to cancel it again later.
                 return True
         # It must be the case that self.__step is already scheduled.
-        self._must_cancel = True
         self._cancel_message = msg
         return True
 
@@ -216,10 +220,6 @@ class Task(futures._PyFuture):  # Inherit Python Task implementation
         if self.done():
             raise exceptions.InvalidStateError(
                 f'_step(): already done: {self!r}, {exc!r}')
-        if self._must_cancel:
-            if not isinstance(exc, exceptions.CancelledError):
-                exc = self._make_cancelled_error()
-            self._must_cancel = False
         coro = self._coro
         self._fut_waiter = None
 
@@ -234,11 +234,13 @@ class Task(futures._PyFuture):  # Inherit Python Task implementation
                 result = coro.throw(exc)
         except StopIteration as exc:
             if self._must_cancel:
-                # Task is cancelled right before coro stops.
+                # We were cancelled, but we're done, so we just pretend
+                # that the cancellation came in too late and the result
+                # was already ready. If the calling Task was the source
+                # of the cancellation, then its own _must_cancel will
+                # still be set, so it will still keep trying to cancel.
                 self._must_cancel = False
-                super().cancel(msg=self._cancel_message)
-            else:
-                super().set_result(exc.value)
+            super().set_result(exc.value)
         except exceptions.CancelledError as exc:
             # Save the original exception so we can chain it later.
             self._cancelled_exc = exc
@@ -272,7 +274,12 @@ class Task(futures._PyFuture):  # Inherit Python Task implementation
                         if self._must_cancel:
                             if self._fut_waiter.cancel(
                                     msg=self._cancel_message):
-                                self._must_cancel = False
+                                # Even if we cancelled the future, we
+                                # leave _must_cancel set because the
+                                # future might racily return a result
+                                # at the same time as the cancellation,
+                                # so we'll need to retry cancellation.
+                                pass
                 else:
                     new_exc = RuntimeError(
                         f'yield was used instead of yield from '
